@@ -178,6 +178,9 @@ pub struct DxfWriter<'a> {
     /// Decimal places of accuracy for ASCII real values; `None` keeps the
     /// default shortest round-trip formatting.
     decimal_places: Option<u8>,
+    /// Thumbnail image bytes for a THUMBNAILIMAGE section; `None` writes no
+    /// preview section.
+    preview: Option<Vec<u8>>,
 }
 
 impl<'a> DxfWriter<'a> {
@@ -188,6 +191,7 @@ impl<'a> DxfWriter<'a> {
             binary: false,
             version: None,
             decimal_places: None,
+            preview: None,
         }
     }
 
@@ -198,6 +202,7 @@ impl<'a> DxfWriter<'a> {
             binary: true,
             version: None,
             decimal_places: None,
+            preview: None,
         }
     }
 
@@ -223,6 +228,14 @@ impl<'a> DxfWriter<'a> {
     /// binary output, which stores full-precision doubles.
     pub fn with_decimal_places(mut self, places: u8) -> Self {
         self.decimal_places = Some(places.min(16));
+        self
+    }
+
+    /// Embed `bytes` as a THUMBNAILIMAGE section (the Write Block "save
+    /// thumbnail preview image" option). The bytes are a Windows DIB, written
+    /// as uppercase hex in 127-byte chunks. Empty bytes write no section.
+    pub fn with_preview(mut self, bytes: Vec<u8>) -> Self {
+        self.preview = Some(bytes);
         self
     }
 
@@ -420,6 +433,15 @@ impl<'a> DxfWriter<'a> {
         section_writer.write_entities(document)?;
         section_writer.write_objects(document)?;
         section_writer.write_acdsdata()?;
+        // The Write Block preview option is only reachable on the ASCII path;
+        // choosing Binary skips it, so a binary file carries no thumbnail.
+        if !self.binary {
+            if let Some(preview) = &self.preview {
+                if !preview.is_empty() {
+                    write_thumbnailimage(writer, preview)?;
+                }
+            }
+        }
 
         // Write EOF
         writer.write_string(0, "EOF")?;
@@ -460,6 +482,25 @@ impl<'a> DxfWriter<'a> {
     pub fn document(&self) -> &CadDocument {
         &self.document
     }
+}
+
+/// Write a THUMBNAILIMAGE section: the preview byte count, then the bytes as
+/// uppercase hex in 127-byte chunks, each under its own 310 group code.
+fn write_thumbnailimage<W: DxfStreamWriter>(writer: &mut W, preview: &[u8]) -> Result<()> {
+    const HEX_CHARS: &[u8; 16] = b"0123456789ABCDEF";
+    writer.write_string(0, "SECTION")?;
+    writer.write_string(2, "THUMBNAILIMAGE")?;
+    writer.write_i32(90, preview.len() as i32)?;
+    for chunk in preview.chunks(127) {
+        let mut hex = String::with_capacity(chunk.len() * 2);
+        for &byte in chunk {
+            hex.push(HEX_CHARS[(byte >> 4) as usize] as char);
+            hex.push(HEX_CHARS[(byte & 0x0F) as usize] as char);
+        }
+        writer.write_string(310, &hex)?;
+    }
+    writer.write_string(0, "ENDSEC")?;
+    Ok(())
 }
 
 fn count_extra_handles(document: &CadDocument, version: crate::types::DxfVersion) -> u64 {
