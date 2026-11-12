@@ -175,6 +175,9 @@ pub struct DxfWriter<'a> {
     pub binary: bool,
     /// Explicit target version; `None` writes the document's own version.
     version: Option<crate::types::DxfVersion>,
+    /// Decimal places of accuracy for ASCII real values; `None` keeps the
+    /// default shortest round-trip formatting.
+    decimal_places: Option<u8>,
 }
 
 impl<'a> DxfWriter<'a> {
@@ -184,6 +187,7 @@ impl<'a> DxfWriter<'a> {
             document,
             binary: false,
             version: None,
+            decimal_places: None,
         }
     }
 
@@ -193,6 +197,7 @@ impl<'a> DxfWriter<'a> {
             document,
             binary: true,
             version: None,
+            decimal_places: None,
         }
     }
 
@@ -211,6 +216,14 @@ impl<'a> DxfWriter<'a> {
     /// Set whether to write binary format
     pub fn set_binary(&mut self, binary: bool) {
         self.binary = binary;
+    }
+
+    /// Round ASCII real values to `places` decimal places (`0..=16`). This is
+    /// the Write Block "decimal places of accuracy" option; it does not affect
+    /// binary output, which stores full-precision doubles.
+    pub fn with_decimal_places(mut self, places: u8) -> Self {
+        self.decimal_places = Some(places.min(16));
+        self
     }
 
     /// Arch records a non-R12 save leaves out. Empty when the target is R12,
@@ -274,6 +287,7 @@ impl<'a> DxfWriter<'a> {
             if let Some(encoding) = encoding {
                 stream_writer.set_encoding(encoding);
             }
+            stream_writer.set_decimal_places(self.decimal_places);
             self.write_dxf(&mut stream_writer, output_version)?;
             stream_writer.flush()?;
         }
@@ -436,6 +450,7 @@ impl<'a> DxfWriter<'a> {
         {
             stream_writer.set_encoding(encoding);
         }
+        stream_writer.set_decimal_places(self.decimal_places);
         r12::write_r12(&mut stream_writer, self.document)?;
         stream_writer.flush()?;
         Ok(())

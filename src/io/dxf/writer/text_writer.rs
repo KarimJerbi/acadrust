@@ -14,6 +14,9 @@ pub struct DxfTextWriter<W: Write> {
     /// Reusable stack buffer for formatting numbers without heap allocation.
     fmt_buf: [u8; 64],
     encoding: Option<crate::io::dxf::code_page::LegacyEncoding>,
+    /// Decimal places of accuracy for real values. `None` keeps the default
+    /// shortest round-trip formatting; `Some(n)` rounds to `n` decimal places.
+    decimal_places: Option<u8>,
 }
 
 impl<W: Write> DxfTextWriter<W> {
@@ -23,12 +26,19 @@ impl<W: Write> DxfTextWriter<W> {
             writer,
             fmt_buf: [0u8; 64],
             encoding: None,
+            decimal_places: None,
         }
     }
 
     /// Select the declared code page for a pre-2007 DXF.
     pub fn set_encoding(&mut self, encoding: crate::io::dxf::code_page::LegacyEncoding) {
         self.encoding = Some(encoding);
+    }
+
+    /// Set the decimal places of accuracy for real values (`0..=16`). `None`
+    /// restores the default shortest round-trip formatting.
+    pub fn set_decimal_places(&mut self, places: Option<u8>) {
+        self.decimal_places = places.map(|p| p.min(16));
     }
 
     fn write_text_crlf(&mut self, value: &str) -> Result<()> {
@@ -100,6 +110,14 @@ impl<W: Write> DxfTextWriter<W> {
             self.fmt_buf[4] = b'\n';
             return 5;
         }
+        if let Some(places) = self.decimal_places {
+            // Explicit accuracy: round to that many decimal places. Extreme
+            // magnitudes keep the scientific-notation path below, where a
+            // decimal-place count carries no meaning.
+            if value.abs() < 1e15 {
+                return self.format_double_rounded(value, places);
+            }
+        }
         let abs = value.abs();
         if abs > 0.0 && abs < 1e-15 {
             // Very small magnitude: {:.16} would lose all significance.
@@ -147,6 +165,46 @@ impl<W: Write> DxfTextWriter<W> {
         self.fmt_buf[len] = b'\r';
         self.fmt_buf[len + 1] = b'\n';
         len + 2
+    }
+
+    /// Round `value` to `places` decimal places (ties away from zero), trim
+    /// trailing fractional zeros but keep at least one fractional digit, and
+    /// write an integer with no decimal point when `places` is 0. Only called
+    /// for finite values below 1e15, so the result fits the stack buffer.
+    fn format_double_rounded(&mut self, value: f64, places: u8) -> usize {
+        let n = places as usize;
+        let factor = 10f64.powi(places as i32);
+        let scaled = (value * factor).round();
+        let negative = scaled < 0.0;
+        let digits = format!("{}", scaled.abs());
+        let mut s = String::with_capacity(digits.len() + 3);
+        if negative {
+            s.push('-');
+        }
+        if n == 0 {
+            s.push_str(&digits);
+        } else {
+            let mut frac = if digits.len() > n {
+                let split = digits.len() - n;
+                s.push_str(&digits[..split]);
+                digits[split..].to_string()
+            } else {
+                s.push('0');
+                let mut f = "0".repeat(n - digits.len());
+                f.push_str(&digits);
+                f
+            };
+            while frac.len() > 1 && frac.ends_with('0') {
+                frac.pop();
+            }
+            s.push('.');
+            s.push_str(&frac);
+        }
+        let bytes = s.as_bytes();
+        self.fmt_buf[..bytes.len()].copy_from_slice(bytes);
+        self.fmt_buf[bytes.len()] = b'\r';
+        self.fmt_buf[bytes.len() + 1] = b'\n';
+        bytes.len() + 2
     }
 
     /// Get the inner writer
@@ -400,5 +458,66 @@ mod tests {
         }
         let output = String::from_utf8(buf).unwrap();
         assert_eq!(output, " 40\r\n15.0\r\n");
+    }
+
+    fn double_with_places(places: u8, value: f64) -> String {
+        let mut buf = Vec::new();
+        {
+            let mut writer = DxfTextWriter::new(&mut buf);
+            writer.set_decimal_places(Some(places));
+            writer.write_double(10, value).unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        output
+            .strip_prefix(" 10\r\n")
+            .unwrap()
+            .strip_suffix("\r\n")
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn decimal_places_rounds_to_that_many_decimals() {
+        assert_eq!(double_with_places(2, 1.23456789), "1.23");
+        assert_eq!(double_with_places(2, 2.34567891), "2.35");
+        assert_eq!(double_with_places(2, 0.0625), "0.06");
+        assert_eq!(double_with_places(2, 37.795), "37.8");
+        assert_eq!(double_with_places(2, 215.8999938964844), "215.9");
+        assert_eq!(double_with_places(4, 1.23456789), "1.2346");
+    }
+
+    #[test]
+    fn decimal_places_ties_round_away_from_zero() {
+        assert_eq!(double_with_places(2, 0.125), "0.13");
+        assert_eq!(double_with_places(2, 10.125), "10.13");
+        assert_eq!(double_with_places(2, 10.375), "10.38");
+        assert_eq!(double_with_places(2, -0.125), "-0.13");
+    }
+
+    #[test]
+    fn decimal_places_keeps_one_fractional_digit_for_whole_values() {
+        assert_eq!(double_with_places(2, 5.0), "5.0");
+        assert_eq!(double_with_places(2, 0.0), "0.0");
+        assert_eq!(double_with_places(1, 5.0), "5.0");
+    }
+
+    #[test]
+    fn decimal_places_zero_writes_an_integer() {
+        assert_eq!(double_with_places(0, 1.23456789), "1");
+        assert_eq!(double_with_places(0, 2.34567891), "2");
+        assert_eq!(double_with_places(0, 5.0), "5");
+        assert_eq!(double_with_places(0, 0.0), "0");
+        assert_eq!(double_with_places(0, 2.5), "3");
+    }
+
+    #[test]
+    fn decimal_places_none_keeps_the_default_formatting() {
+        let mut buf = Vec::new();
+        {
+            let mut writer = DxfTextWriter::new(&mut buf);
+            writer.set_decimal_places(None);
+            writer.write_double(10, 943.920153).unwrap();
+        }
+        assert_eq!(String::from_utf8(buf).unwrap(), " 10\r\n943.920153\r\n");
     }
 }
